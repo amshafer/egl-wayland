@@ -23,7 +23,7 @@
 #include "wayland-egldisplay.h"
 #include "wayland-eglstream-client-protocol.h"
 #include "wayland-eglstream-controller-client-protocol.h"
-#include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "linux-dmabuf-v1-client-protocol.h"
 #include "wayland-eglstream-server.h"
 #include "wayland-thread.h"
 #include "wayland-eglsurface-internal.h"
@@ -46,7 +46,16 @@ typedef struct WlServerProtocolsRec {
     EGLBoolean hasEglStream;
     EGLBoolean hasDmaBuf;
     struct zwp_linux_dmabuf_v1 *wlDmaBuf;
+    int dmabufVersion;
     dev_t devId;
+
+    struct {
+        dev_t targetDev;
+        bool sampled;
+    } currentTranche;
+    dev_t nvidia_sample_dev;  /* first sampling tranche targeting NVIDIA GPU */
+    dev_t first_sample_dev;   /* first sampling tranche, any GPU */
+    dev_t primeSamplingDev;   /* non-NVIDIA sampling device; set when PRIME path is needed */
 
     WlEglPlatformData *pData;
 
@@ -307,6 +316,8 @@ dmabuf_feedback_tranche_flags(void *data,
 
     if (flags & ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT)
         feedback->tmpTranche.supportsScanout = true;
+    if (flags & ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SAMPLING)
+        feedback->tmpTranche.supportsSampling = true;
 }
 
 static void
@@ -446,7 +457,7 @@ registry_handle_global(void *data,
             display->wlDmaBuf = wl_registry_bind(registry,
                                                  name,
                                                  &zwp_linux_dmabuf_v1_interface,
-                                                 version > 3 ? 4 : 3);
+                                                 version > 6 ? 6 : version);
         }
         display->dmaBufProtocolVersion = version;
     } else if (strcmp(interface, "wp_presentation") == 0) {
@@ -531,9 +542,12 @@ dmabuf_feedback_check_tranche_target_device(void *data,
                                       struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback,
                                       struct wl_array *dev)
 {
-    (void) data;
+    WlServerProtocols *protocols = (WlServerProtocols *)data;
     (void) dmabuf_feedback;
     (void) dev;
+
+    assert(dev->size == sizeof(dev_t));
+    memcpy(&protocols->currentTranche.targetDev, dev->data, sizeof(dev_t));
 }
 
 static void
@@ -541,9 +555,10 @@ dmabuf_feedback_check_tranche_flags(void *data,
                               struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback,
                               uint32_t flags)
 {
-    (void) data;
+    WlServerProtocols *protocols = (WlServerProtocols *)data;
     (void) dmabuf_feedback;
-    (void) flags;
+
+    protocols->currentTranche.sampled = flags & ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SAMPLING;
 }
 
 static void
@@ -560,8 +575,30 @@ static void
 dmabuf_feedback_check_tranche_done(void *data,
                              struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback)
 {
-    (void) data;
+    WlServerProtocols *protocols = (WlServerProtocols *)data;
+    drmDevice *drm_device;
     (void) dmabuf_feedback;
+
+    if (!protocols->currentTranche.sampled) {
+        return;
+    }
+
+    dev_t targetDev = protocols->currentTranche.targetDev;
+
+    /* Track the first sampling tranche regardless of GPU vendor */
+    if (protocols->first_sample_dev == 0) {
+        protocols->first_sample_dev = targetDev;
+    }
+
+    /* Check if this sampling tranche targets an NVIDIA GPU */
+    if (protocols->nvidia_sample_dev == 0 &&
+        protocols->pData->getDeviceFromDevId(targetDev, 0, &drm_device) == 0) {
+        if (drm_device->bustype == DRM_BUS_PCI &&
+            drm_device->deviceinfo.pci->vendor_id == 0x10de) {
+            protocols->nvidia_sample_dev = targetDev;
+        }
+        drmFreeDevice(&drm_device);
+    }
 }
 
 static void
@@ -571,6 +608,30 @@ dmabuf_feedback_check_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *dmab
     drmDevice *drm_device;
 
     (void) dmabuf_feedback;
+
+    /*
+     * On dmabuf v6, the main_device event is deprecated. Determine devId from
+     * the sampling tranches advertised in this feedback cycle:
+     *
+     * - If any tranche with the SAMPLING flag targets the NVIDIA GPU, the
+     *   compositor can sample directly from NVIDIA buffers; use that device
+     *   (no PRIME copy needed).
+     * - Otherwise, fall back to the first sampling tranche seen (non-NVIDIA).
+     *   The compositor will need to import the buffer via a PRIME copy, so
+     *   save this device for use as the set_sampling_device hint.
+     *
+     * Clear per-cycle state so the next feedback cycle starts fresh.
+     */
+    if (protocols->dmabufVersion >= 6) {
+        if (protocols->nvidia_sample_dev != 0) {
+            protocols->devId = protocols->nvidia_sample_dev;
+        } else if (protocols->first_sample_dev != 0) {
+            protocols->devId = protocols->first_sample_dev;
+            protocols->primeSamplingDev = protocols->first_sample_dev;
+        }
+        protocols->nvidia_sample_dev = 0;
+        protocols->first_sample_dev = 0;
+    }
 
     assert(protocols->pData->getDeviceFromDevId);
     if (protocols->pData->getDeviceFromDevId(protocols->devId, 0, &drm_device) == 0) {
@@ -625,9 +686,11 @@ registry_handle_global_check_protocols(
     if ((strcmp(interface, "zwp_linux_dmabuf_v1") == 0) &&
         (version >= 3)) {
         protocols->hasDmaBuf = EGL_TRUE;
+        protocols->dmabufVersion = version;
         /* Version 4 introduced default_feedback which allows us to determine the device used by the compositor */
         if (version >= 4) {
-            protocols->wlDmaBuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, 4);
+            protocols->wlDmaBuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
+                                                   version > 6 ? 6 : version);
         }
     }
 
@@ -1158,10 +1221,14 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
         }
     }
 
-    if (eglDevice == EGL_NO_DEVICE_EXT && usePrimeRenderOffload) {
+    if (eglDevice == EGL_NO_DEVICE_EXT &&
+        (usePrimeRenderOffload || protocols.primeSamplingDev != 0)) {
         /*
-         * If __NV_PRIME_RENDER_OFFLOAD is set, then use an NVIDIA device. It
-         * doesn't matter which one.
+         * No NVIDIA EGL device matched the compositor's device.  Either the
+         * __NV_PRIME_RENDER_OFFLOAD env var was set explicitly, or the dmabuf
+         * feedback showed that the compositor cannot sample from any NVIDIA
+         * GPU directly (PRIME copy path required).  Pick the first available
+         * NVIDIA device for rendering.
          */
         eglDevice = eglDeviceList[0];
     }
@@ -1169,14 +1236,6 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     if (eglDevice == EGL_NO_DEVICE_EXT) {
         // If we couldn't find a device to render on, then fail.
         goto fail;
-    }
-
-    if (eglDevice != serverDevice) {
-        /*
-         * If we're rendering with a different device than the compositor is
-         * using, then we'll need to use the PRIME offloading path.
-         */
-        display->primeRenderOffload = EGL_TRUE;
     }
 
     display->devDpy = wlGetInternalDisplay(pData, eglDevice);
