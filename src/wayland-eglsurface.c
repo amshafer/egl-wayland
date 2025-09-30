@@ -23,7 +23,7 @@
 #include "wayland-eglsurface-internal.h"
 #include "wayland-eglstream-client-protocol.h"
 #include "wayland-eglstream-controller-client-protocol.h"
-#include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "linux-dmabuf-v1-client-protocol.h"
 #include "linux-drm-syncobj-v1-client-protocol.h"
 #include "wayland-eglstream-server.h"
 #include "wayland-thread.h"
@@ -1280,6 +1280,8 @@ acquire_surface_image(WlEglDisplay *display, WlEglSurface *surface)
     WlEglStreamImage   *image = NULL;
     struct zwp_linux_dmabuf_v1 *wrapper = NULL;
     struct zwp_linux_buffer_params_v1 *params;
+    struct wl_array     wlDev;
+    dev_t               *wlDevData;
     EGLuint64KHR        modifier;
     int                 format;
     int                 planes;
@@ -1379,6 +1381,27 @@ acquire_surface_image(WlEglDisplay *display, WlEglSurface *surface)
                 format = DRM_FORMAT_XRGB8888;
             }
         }
+
+        /*
+         * If the compositor has support, tell it which device this buffer
+         * resides on so it knows where to import it.
+         *
+         * In non-PRIME mode the compositor samples from the NVIDIA GPU directly,
+         * so advertise the NVIDIA render node.  In PRIME mode the compositor
+         * cannot sample from NVIDIA and will import the buffer onto its own
+         * (non-NVIDIA) device, so advertise that device instead.
+         */
+        wl_array_init(&wlDev);
+        if (display->dmaBufProtocolVersion >= 6
+            && (wlDevData = (dev_t *)wl_array_add(&wlDev, sizeof(dev_t)))) {
+            if (display->primeRenderOffload && display->primeSamplingDevice != 0) {
+                *wlDevData = display->primeSamplingDevice;
+            } else {
+                *wlDevData = display->devDpy->renderNode;
+            }
+            zwp_linux_buffer_params_v1_set_sampling_device(params, &wlDev);
+        }
+        wl_array_release(&wlDev);
 
         image->buffer = zwp_linux_buffer_params_v1_create_immed(params,
                                                                 surface->width,
@@ -2285,6 +2308,15 @@ wlEglReallocSurface(WlEglDisplay *display, WlEglPlatformData *pData, WlEglSurfac
     surface->ctx.damageThreadId = (pthread_t)0;
     surface->feedback.unprocessedFeedback = false;
 
+    /*
+     * If the compositor sent new default feedback, re-evaluate the PRIME
+     * render offload state before recreating the surface context.  This
+     * allows the PRIME vs. single-GPU path to change dynamically if the
+     * compositor's sampling capabilities change (e.g. GPU hotplug, surface
+     * moving between outputs backed by different GPUs).
+     */
+    if (display->defaultFeedback.unprocessedFeedback)
+        wlEglUpdatePrimeState(display);
     display->defaultFeedback.unprocessedFeedback = false;
 
     err = create_surface_context(surface);

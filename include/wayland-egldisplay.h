@@ -68,6 +68,7 @@ typedef struct WlEglDmaBufFormatSetRec {
 typedef struct WlEglDmaBufTrancheRec {
     dev_t drmDev;
     int supportsScanout;
+    int supportsSampling;
     WlEglDmaBufFormatSet formatSet;
 } WlEglDmaBufTranche;
 
@@ -182,6 +183,7 @@ typedef struct WlEglDisplayRec {
     WlEglDmaBufFeedback defaultFeedback;
 
     EGLBoolean primeRenderOffload;
+    dev_t primeSamplingDevice;
 
     char *extensionString;
 } WlEglDisplay;
@@ -198,6 +200,7 @@ typedef struct WlEventQueueRec {
 
 int WlEglRegisterFeedback(WlEglDmaBufFeedback *feedback);
 void wlEglDestroyFeedback(WlEglDmaBufFeedback *feedback);
+void wlEglUpdatePrimeState(WlEglDisplay *display);
 EGLBoolean wlEglIsValidNativeDisplayExport(void *data, void *nativeDpy);
 EGLBoolean wlEglBindDisplaysHook(void *data, EGLDisplay dpy, void *nativeDpy);
 EGLBoolean wlEglUnbindDisplaysHook(EGLDisplay dpy, void *nativeDpy);
