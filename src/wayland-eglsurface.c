@@ -1710,6 +1710,8 @@ static uint32_t ConfigToDrmFourCC(WlEglDisplay* display, EGLConfig config)
         return DRM_FORMAT_XRGB2101010;
     case PACK_CONFIG(10, 10, 10, 2):
         return DRM_FORMAT_ARGB2101010;
+    case PACK_CONFIG(16, 16, 16, 16):
+        return DRM_FORMAT_ABGR16161616F;
     default:
         return 0; /* DRM_FORMAT_INVALID */
     }
